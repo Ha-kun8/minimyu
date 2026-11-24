@@ -537,6 +537,110 @@ def speak(text):
         play_file(sent, path)
 
 
+# ---------------------------------------------------------------- スクリーンショット (F9)
+# F9キーを押すと画面を撮影して shots フォルダに保存し、ポート8792で配信する。
+# ミューが Tailscale 経由で取りに来るための仕組み。標準ライブラリだけで動く。
+# 失敗してもウェイクワード本体には影響しない。
+SHOT_PORT = 8792
+SHOT_DIR = os.path.join(BASE_DIR, "shots")
+
+
+def _png_bytes_from_bgra(raw, w, h):
+    import struct
+    import zlib
+    rows = []
+    stride = w * 4
+    for y in range(h):
+        line = raw[y * stride:(y + 1) * stride]
+        rgb = bytearray(w * 3)
+        rgb[0::3] = line[2::4]
+        rgb[1::3] = line[1::4]
+        rgb[2::3] = line[0::4]
+        rows.append(b"\x00" + bytes(rgb))
+
+    def chunk(tag, data):
+        c = struct.pack(">I", len(data)) + tag + data
+        c += struct.pack(">I", zlib.crc32(tag + data) & 0xFFFFFFFF)
+        return c
+
+    ihdr = struct.pack(">IIBBBBB", w, h, 8, 2, 0, 0, 0)
+    return (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", ihdr)
+            + chunk(b"IDAT", zlib.compress(b"".join(rows), 6)) + chunk(b"IEND", b""))
+
+
+def _capture_screen_png():
+    import ctypes
+    user32 = ctypes.windll.user32
+    gdi32 = ctypes.windll.gdi32
+    w = user32.GetSystemMetrics(0)
+    h = user32.GetSystemMetrics(1)
+    hdc_screen = user32.GetDC(0)
+    hdc_mem = gdi32.CreateCompatibleDC(hdc_screen)
+    hbmp = gdi32.CreateCompatibleBitmap(hdc_screen, w, h)
+    try:
+        gdi32.SelectObject(hdc_mem, hbmp)
+        gdi32.BitBlt(hdc_mem, 0, 0, w, h, hdc_screen, 0, 0, 0x00CC0020)
+
+        class BITMAPINFOHEADER(ctypes.Structure):
+            _fields_ = [("biSize", ctypes.c_uint32), ("biWidth", ctypes.c_int32),
+                        ("biHeight", ctypes.c_int32), ("biPlanes", ctypes.c_uint16),
+                        ("biBitCount", ctypes.c_uint16), ("biCompression", ctypes.c_uint32),
+                        ("biSizeImage", ctypes.c_uint32), ("biXPelsPerMeter", ctypes.c_int32),
+                        ("biYPelsPerMeter", ctypes.c_int32), ("biClrUsed", ctypes.c_uint32),
+                        ("biClrImportant", ctypes.c_uint32)]
+
+        bmi = BITMAPINFOHEADER()
+        bmi.biSize = ctypes.sizeof(BITMAPINFOHEADER)
+        bmi.biWidth = w
+        bmi.biHeight = -h
+        bmi.biPlanes = 1
+        bmi.biBitCount = 32
+        bmi.biCompression = 0
+        buf = ctypes.create_string_buffer(w * h * 4)
+        gdi32.GetDIBits(hdc_mem, hbmp, 0, h, buf, ctypes.byref(bmi), 0)
+        return _png_bytes_from_bgra(buf.raw, w, h)
+    finally:
+        gdi32.DeleteObject(hbmp)
+        gdi32.DeleteDC(hdc_mem)
+        user32.ReleaseDC(0, hdc_screen)
+
+
+def _shotkey_main():
+    try:
+        import ctypes
+        from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
+        os.makedirs(SHOT_DIR, exist_ok=True)
+
+        class H(SimpleHTTPRequestHandler):
+            def __init__(self, *a, **kw):
+                super().__init__(*a, directory=SHOT_DIR, **kw)
+
+            def log_message(self, *a):
+                pass
+
+        threading.Thread(target=ThreadingHTTPServer(("0.0.0.0", SHOT_PORT), H).serve_forever, daemon=True).start()
+        log(f"スクリーンショット待機中（F9で撮影、ポート{SHOT_PORT}で配信）")
+        user32 = ctypes.windll.user32
+        was_down = False
+        while True:
+            down = bool(user32.GetAsyncKeyState(0x78) & 0x8000)  # F9
+            if down and not was_down:
+                try:
+                    data = _capture_screen_png()
+                    ts = time.strftime("%Y%m%d-%H%M%S")
+                    with open(os.path.join(SHOT_DIR, "latest.png"), "wb") as f:
+                        f.write(data)
+                    with open(os.path.join(SHOT_DIR, f"shot-{ts}.png"), "wb") as f:
+                        f.write(data)
+                    log(f"スクリーンショットを保存しました ({ts})")
+                except Exception as e:
+                    log(f"スクリーンショット失敗: {e}")
+            was_down = down
+            time.sleep(0.05)
+    except Exception as e:
+        log(f"スクリーンショット機能は無効です: {e}")
+
+
 # ---------------------------------------------------------------- メインループ
 def main():
     cfg = load_config()
@@ -559,6 +663,7 @@ def main():
         raise RuntimeError("Open WebUI に接続できませんでした")
     threading.Thread(target=warmup_model, daemon=True).start()
     threading.Thread(target=ensure_igl_preset, daemon=True).start()
+    threading.Thread(target=_shotkey_main, daemon=True).start()
     load_whisper()
     calibrate_noise(mic_index)
     log("待機中。「ミニミュー」と話しかけてください（Ctrl+Cで終了）")
