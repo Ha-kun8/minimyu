@@ -52,6 +52,7 @@ state = {
     "barge_event": threading.Event(),   # 読み上げ中にウェイクワードを検知したら立つ
     "monitor_stop": threading.Event(),
     "monitor_thread": None,
+    "mode": "normal",       # "normal" か "igl"（Valorant作戦モード）
 }
 
 
@@ -161,6 +162,16 @@ def beep(freq=880, sec=0.12):
 def load_whisper():
     from faster_whisper import WhisperModel
     log("音声認識モデルを読み込み中（初回はダウンロードが入ります）…")
+    # pipで入れたCUDAライブラリ（cuBLAS/cuDNN）の場所をWindowsに教える
+    try:
+        import site
+        for sp in site.getsitepackages():
+            for sub in (r"nvidia\cublas\bin", r"nvidia\cudnn\bin"):
+                d = os.path.join(sp, sub)
+                if os.path.isdir(d):
+                    os.add_dll_directory(d)
+    except Exception:
+        pass
 
     def load(name):
         # まずGPU（CUDA）を試し、ダメならCPUに自動で戻す
@@ -234,6 +245,88 @@ def find_wake(text):
     return None, None, n
 
 
+# ---------------------------------------------------------------- IGLモード
+IGL_MODEL_ID = "igl"
+IGL_SYSTEM_PROMPT = """あなたはValorantの作戦参謀（IGLサポーター）です。ユーザーはゴールド3（最高プラチナ3）で、デュエリストとコントローラーを使います。
+
+# 答え方
+- 音声で読み上げるため、結論から3文以内、短く答える。理由は1つだけ。
+- 情報が足りなければ「攻めか守りか」「残りクレジット」「ウルトの有無」のうち1つだけ聞き返す。
+- マップ固有の定点（ラインナップ）は、知らないものを創作しない。「定点は知らない」と言う。
+- 試合中のリアルタイムコールは扱わない。ラウンド間と買いフェーズの相談に徹する。
+
+# ユーザーの使用エージェント
+- コントローラー: ミクス、クローヴ
+- デュエリスト: ハッシュ、ウェイレイ、ジェット、レイナ
+- ヨルとオーメンは使わない。編成や作戦に絶対に入れない。
+
+# 作戦の考え方
+- ミクスはマップ指定でスモークを即時展開でき、ハーモナイズで自分と味方1人を加速できる。エントリーのタイミングを自分で作れる前提で、実行（エグゼキュート）の組み立てを優先する。ウルトのバスクエイクはサイト攻略とリテイクの起点。
+- クローヴは死後もスモークを出せる。早く倒れてもコールとスモークで関与できる前提でよい。
+- 買い判断はチーム全員のクレジットで考える。ピストルラウンド負けは基本エコ、勝ちはフル買い寄せ。2連敗したら3ラウンド目はセーブし、4ラウンド目に全員フル買いを揃える。一人だけの無理なフォースは止める。
+- 迷ったら「人数を揃えて当たる」か「デフォルトで情報を取る」の2択に落として提示する。"""
+
+
+def ensure_igl_preset():
+    """Open WebUIにIGLプリセットが無ければ作る（失敗しても起動は続ける）"""
+    try:
+        headers = {"Authorization": f"Bearer {state['token']}"}
+        r = requests.get(f"{OWUI_URL}/api/models", headers=headers, timeout=30)
+        r.raise_for_status()
+        data = r.json()
+        models = data.get("data", []) if isinstance(data, dict) else data
+        ids = [m.get("id") for m in models]
+        if IGL_MODEL_ID in ids:
+            return
+        body = {
+            "id": IGL_MODEL_ID,
+            "name": "IGL",
+            "base_model_id": "qwen/qwen3-14b",
+            "params": {"system": IGL_SYSTEM_PROMPT},
+            "meta": {"description": "Valorantの作戦相談用（ミニミューから自動作成）"},
+            "is_active": True,
+        }
+        r = requests.post(f"{OWUI_URL}/api/v1/models/create", headers=headers,
+                          json=body, timeout=30)
+        r.raise_for_status()
+        requests.get(f"{OWUI_URL}/api/models", headers=headers, timeout=30)
+        log("IGLプリセットを作成しました")
+    except Exception as e:
+        log(f"IGLプリセットの用意に失敗（IGLモードは使えません）: {e}")
+
+
+def warmup_model():
+    """起動直後にモデルを先読みして、最初の応答を速くする"""
+    try:
+        headers = {"Authorization": f"Bearer {state['token']}"}
+        requests.post(f"{OWUI_URL}/api/chat/completions", headers=headers,
+                      json={"model": MODEL_ID,
+                            "messages": [{"role": "user", "content": "おはよう /no_think"}],
+                            "stream": False},
+                      timeout=300)
+        log("モデルを先読みしました")
+    except Exception as e:
+        log(f"モデルの先読みに失敗（初回だけ少し待ちます）: {e}")
+
+
+def check_mode_command(command):
+    """モード切替の音声コマンドだったら処理して True を返す"""
+    n = normalize(command).lower()
+    if n in ("iglもーど", "あいじーえるもーど", "あいじーえる", "igl",
+             "ばろもーど", "ゔぁろもーど"):
+        state["mode"] = "igl"
+        state["history"] = []
+        speak("IGLモードに切り替えました。マップと、攻めか守りかを教えてください")
+        return True
+    if n in ("通常もーど", "つうじょうもーど", "iglしゅうりょう",
+             "あいじーえるしゅうりょう", "もーどしゅうりょう", "もとにもどして"):
+        state["mode"] = "normal"
+        state["history"] = []
+        speak("通常モードに戻しました")
+        return True
+    return False
+
+
 # ---------------------------------------------------------------- 割り込み監視
 def watch_barge():
     """読み上げ中にマイクを監視し、ウェイクワードを聞いたら割り込みを立てる。
@@ -267,7 +360,8 @@ def ask_minimyu(text):
     headers = {"Authorization": f"Bearer {state['token']}"}
     msgs = state["history"][-12:] + [{"role": "user", "content": text + " /no_think"}]
     r = requests.post(f"{OWUI_URL}/api/chat/completions", headers=headers,
-                      json={"model": MODEL_ID, "messages": msgs, "stream": True},
+                      json={"model": IGL_MODEL_ID if state["mode"] == "igl" else MODEL_ID,
+                            "messages": msgs, "stream": True},
                       timeout=600, stream=True)
     r.raise_for_status()
     # 読み上げ中の割り込み（バージイン）監視を開始
@@ -444,6 +538,8 @@ def main():
             time.sleep(10)
     else:
         raise RuntimeError("Open WebUI に接続できませんでした")
+    threading.Thread(target=warmup_model, daemon=True).start()
+    threading.Thread(target=ensure_igl_preset, daemon=True).start()
     load_whisper()
     calibrate_noise(mic_index)
     log("待機中。「ミニミュー」と話しかけてください（Ctrl+Cで終了）")
@@ -477,6 +573,8 @@ def main():
         if not command:
             continue
         print(f"あなた: {command}", flush=True)
+        if check_mode_command(command):
+            continue
         if command in ("リセット", "りせっと", "会話をリセット"):
             state["history"] = []
             speak("会話をリセットしました")
@@ -507,6 +605,8 @@ def main():
             if not command:
                 break
             print(f"あなた: {command}", flush=True)
+            if check_mode_command(command):
+                break
             if command in ("リセット", "りせっと", "会話をリセット"):
                 state["history"] = []
                 speak("会話をリセットしました")
