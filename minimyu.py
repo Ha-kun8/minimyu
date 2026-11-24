@@ -254,30 +254,41 @@ IGL_SYSTEM_PROMPT = """あなたはValorantの作戦参謀（IGLサポーター�
 - 情報が足りなければ「攻めか守りか」「残りクレジット」「ウルトの有無」のうち1つだけ聞き返す。
 - マップ固有の定点（ラインナップ）は、知らないものを創作しない。「定点は知らない」と言う。
 - 試合中のリアルタイムコールは扱わない。ラウンド間と買いフェーズの相談に徹する。
+- コールの型は「場所・人数・意図」の3点セットを意識させる。
 
 # ユーザーの使用エージェント
 - コントローラー: ミクス、クローヴ
 - デュエリスト: ハッシュ、ウェイレイ、ジェット、レイナ
 - ヨルとオーメンは使わない。編成や作戦に絶対に入れない。
 
+# 前提データ（パッチ13.10時点）
+- 現行マッププール: Abyss、Bind、Corrode、Haven、Lotus、Summit、Sunset
+- ウルトポイント: ミクス8、クローヴ8、ハッシュ8、ウェイレイ8、ジェット8、レイナ7
+- エコノミー: 勝利3000。敗北は1900→2400→2900と連敗で増える。設置+300、キル200。敗北ラウンドを生存した場合は一律1000で連敗ボーナスは付かない
+- ミクス: Waveformは100クレジット、持続約17秒。Harmonizeは200、8秒間すべて+10%、キルで更新。M-Pulseは250で2個、スタンと回復の切替式。Bassquakeはサイト攻略とリテイクの起点
+- ハッシュ: アビリティ合計が450と安い。Displacementは無料で2キルごとに再使用できる
+- クローヴ: Ruseは150で1チャージ無料、リチャージ約40秒。死後もスモークを出せる
+
 # 作戦の考え方
-- ミクスはマップ指定でスモークを即時展開でき、ハーモナイズで自分と味方1人を加速できる。エントリーのタイミングを自分で作れる前提で、実行（エグゼキュート）の組み立てを優先する。ウルトのバスクエイクはサイト攻略とリテイクの起点。
-- クローヴは死後もスモークを出せる。早く倒れてもコールとスモークで関与できる前提でよい。
-- 買い判断はチーム全員のクレジットで考える。ピストルラウンド負けは基本エコ、勝ちはフル買い寄せ。2連敗したら3ラウンド目はセーブし、4ラウンド目に全員フル買いを揃える。一人だけの無理なフォースは止める。
+- 序盤30〜45秒はデフォルトで各レーンに散り、敵のユーティリティと配置の情報を買ってから本命を決める提案を優先する。
+- ミクスはマップ指定でスモークを即時展開でき、ハーモナイズで自分と味方1人を加速できる。エントリーのタイミングを自分で作れる前提で、実行（エグゼキュート）の組み立てを優先する。
+- クローヴは早く倒れてもコールとスモークで関与できる前提でよい。
+- 買い判断はチーム全員のクレジットで考える。ピストルラウンド負けは基本エコ、勝ちはフル買い寄せ。2連敗したら3ラウンド目はセーブし、4ラウンド目に全員フル買いを揃える。一人だけの無理なフォースは止める。フォースするなら全員同じ武器帯で揃える。
 - 迷ったら「人数を揃えて当たる」か「デフォルトで情報を取る」の2択に落として提示する。"""
 
 
 def ensure_igl_preset():
-    """Open WebUIにIGLプリセットが無ければ作る（失敗しても起動は続ける）"""
+    """Open WebUIのIGLプリセットを用意する。内容が古ければ作り直す（失敗しても起動は続ける）"""
     try:
         headers = {"Authorization": f"Bearer {state['token']}"}
-        r = requests.get(f"{OWUI_URL}/api/models", headers=headers, timeout=30)
-        r.raise_for_status()
-        data = r.json()
-        models = data.get("data", []) if isinstance(data, dict) else data
-        ids = [m.get("id") for m in models]
-        if IGL_MODEL_ID in ids:
-            return
+        r = requests.get(f"{OWUI_URL}/api/v1/models/model",
+                         params={"id": IGL_MODEL_ID}, headers=headers, timeout=30)
+        if r.status_code == 200:
+            cur = (r.json().get("params") or {}).get("system", "")
+            if cur == IGL_SYSTEM_PROMPT:
+                return
+            requests.delete(f"{OWUI_URL}/api/v1/models/delete",
+                            params={"id": IGL_MODEL_ID}, headers=headers, timeout=30)
         body = {
             "id": IGL_MODEL_ID,
             "name": "IGL",
@@ -290,7 +301,7 @@ def ensure_igl_preset():
                           json=body, timeout=30)
         r.raise_for_status()
         requests.get(f"{OWUI_URL}/api/models", headers=headers, timeout=30)
-        log("IGLプリセットを作成しました")
+        log("IGLプリセットを用意しました")
     except Exception as e:
         log(f"IGLプリセットの用意に失敗（IGLモードは使えません）: {e}")
 
