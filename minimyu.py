@@ -173,10 +173,18 @@ def load_whisper():
     except Exception:
         pass
 
+    def make(name, device, compute_type):
+        # キャッシュがあればネット確認をせず即読み込み（HFの応答待ちで固まるのを防ぐ）
+        try:
+            return WhisperModel(name, device=device, compute_type=compute_type,
+                                local_files_only=True)
+        except Exception:
+            return WhisperModel(name, device=device, compute_type=compute_type)
+
     def load(name):
         # まずGPU（CUDA）を試し、ダメならCPUに自動で戻す
         try:
-            m = WhisperModel(name, device="cuda", compute_type="float16")
+            m = make(name, "cuda", "float16")
             # 推論まで通るか無音で試す（DLL不足は読み込みでなく推論で判明するため）
             for _ in m.transcribe(np.zeros(SAMPLE_RATE, dtype="float32"),
                                   language="ja")[0]:
@@ -185,7 +193,7 @@ def load_whisper():
             return m
         except Exception as e:
             log(f"{name}: GPUが使えないためCPUで読み込みます ({e})")
-            return WhisperModel(name, device="cpu", compute_type="int8")
+            return make(name, "cpu", "int8")
 
     state["whisper_base"] = load("base")
     # 用件の文字起こし用に、ひと回り大きいモデルも用意する（失敗したら base で代用）
